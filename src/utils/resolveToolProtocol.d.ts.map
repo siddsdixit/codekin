@@ -1,0 +1,1 @@
+{"version":3,"file":"resolveToolProtocol.d.ts","sourceRoot":"","sources":["resolveToolProtocol.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,YAAY,EAAiB,MAAM,iBAAiB,CAAA;AAC7D,OAAO,KAAK,EAAE,gBAAgB,EAAE,YAAY,EAAE,SAAS,EAAE,MAAM,iBAAiB,CAAA;AAGhF;;;;;;;;;;;;;;;;GAgBG;AACH,wBAAgB,mBAAmB,CAClC,gBAAgB,EAAE,gBAAgB,EAClC,SAAS,CAAC,EAAE,SAAS,EACrB,QAAQ,CAAC,EAAE,YAAY,GACrB,YAAY,CAgCd"}

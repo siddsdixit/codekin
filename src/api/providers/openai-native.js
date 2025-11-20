@@ -1,0 +1,1034 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.OpenAiNativeHandler = void 0;
+const openai_1 = __importDefault(require("openai"));
+const types_1 = require("@roo-code/types");
+const cost_1 = require("../../shared/cost");
+const model_params_1 = require("../transform/model-params");
+const base_provider_1 = require("./base-provider");
+class OpenAiNativeHandler extends base_provider_1.BaseProvider {
+    options;
+    client;
+    // Resolved service tier from Responses API (actual tier used by OpenAI)
+    lastServiceTier;
+    // Complete response output array (includes reasoning items with encrypted_content)
+    lastResponseOutput;
+    // Last top-level response id from Responses API (for troubleshooting)
+    lastResponseId;
+    // Abort controller for cancelling ongoing requests
+    abortController;
+    // Event types handled by the shared event processor to avoid duplication
+    coreHandledEventTypes = new Set([
+        "response.text.delta",
+        "response.output_text.delta",
+        "response.reasoning.delta",
+        "response.reasoning_text.delta",
+        "response.reasoning_summary.delta",
+        "response.reasoning_summary_text.delta",
+        "response.refusal.delta",
+        "response.output_item.added",
+        "response.done",
+        "response.completed",
+    ]);
+    constructor(options) {
+        super();
+        this.options = options;
+        // Default to including reasoning.summary: "auto" for models that support Responses API
+        // reasoning summaries unless explicitly disabled.
+        if (this.options.enableResponsesReasoningSummary === undefined) {
+            this.options.enableResponsesReasoningSummary = true;
+        }
+        const apiKey = this.options.openAiNativeApiKey ?? "not-provided";
+        this.client = new openai_1.default({ baseURL: this.options.openAiNativeBaseUrl, apiKey });
+    }
+    normalizeUsage(usage, model) {
+        if (!usage)
+            return undefined;
+        // Prefer detailed shapes when available (Responses API)
+        const inputDetails = usage.input_tokens_details ?? usage.prompt_tokens_details;
+        // Extract cache information from details with better readability
+        const hasCachedTokens = typeof inputDetails?.cached_tokens === "number";
+        const hasCacheMissTokens = typeof inputDetails?.cache_miss_tokens === "number";
+        const cachedFromDetails = hasCachedTokens ? inputDetails.cached_tokens : 0;
+        const missFromDetails = hasCacheMissTokens ? inputDetails.cache_miss_tokens : 0;
+        // If total input tokens are missing but we have details, derive from them
+        let totalInputTokens = usage.input_tokens ?? usage.prompt_tokens ?? 0;
+        if (totalInputTokens === 0 && inputDetails && (cachedFromDetails > 0 || missFromDetails > 0)) {
+            totalInputTokens = cachedFromDetails + missFromDetails;
+        }
+        const totalOutputTokens = usage.output_tokens ?? usage.completion_tokens ?? 0;
+        // Note: missFromDetails is NOT used as fallback for cache writes
+        // Cache miss tokens represent tokens that weren't found in cache (part of input)
+        // Cache write tokens represent tokens being written to cache for future use
+        const cacheWriteTokens = usage.cache_creation_input_tokens ?? usage.cache_write_tokens ?? 0;
+        const cacheReadTokens = usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? usage.cached_tokens ?? cachedFromDetails ?? 0;
+        // Resolve effective tier: prefer actual tier from response; otherwise requested tier
+        const effectiveTier = this.lastServiceTier || this.options.openAiNativeServiceTier || undefined;
+        const effectiveInfo = this.applyServiceTierPricing(model.info, effectiveTier);
+        // Pass total input tokens directly to calculateApiCostOpenAI
+        // The function handles subtracting both cache reads and writes internally
+        const { totalCost } = (0, cost_1.calculateApiCostOpenAI)(effectiveInfo, totalInputTokens, totalOutputTokens, cacheWriteTokens, cacheReadTokens);
+        const reasoningTokens = typeof usage.output_tokens_details?.reasoning_tokens === "number"
+            ? usage.output_tokens_details.reasoning_tokens
+            : undefined;
+        const out = {
+            type: "usage",
+            // Keep inputTokens as TOTAL input to preserve correct context length
+            inputTokens: totalInputTokens,
+            outputTokens: totalOutputTokens,
+            cacheWriteTokens,
+            cacheReadTokens,
+            ...(typeof reasoningTokens === "number" ? { reasoningTokens } : {}),
+            totalCost,
+        };
+        return out;
+    }
+    async *createMessage(systemPrompt, messages, metadata) {
+        const model = this.getModel();
+        // Use Responses API for ALL models
+        yield* this.handleResponsesApiMessage(model, systemPrompt, messages, metadata);
+    }
+    async *handleResponsesApiMessage(model, systemPrompt, messages, metadata) {
+        // Reset resolved tier for this request; will be set from response if present
+        this.lastServiceTier = undefined;
+        // Reset output array to capture current response output items
+        this.lastResponseOutput = undefined;
+        // Reset last response id for this request
+        this.lastResponseId = undefined;
+        // Use Responses API for ALL models
+        const { verbosity, reasoning } = this.getModel();
+        // Resolve reasoning effort for models that support it
+        const reasoningEffort = this.getReasoningEffort(model);
+        // Format full conversation (messages already include reasoning items from API history)
+        const formattedInput = this.formatFullConversation(systemPrompt, messages);
+        // Build request body
+        const requestBody = this.buildRequestBody(model, formattedInput, systemPrompt, verbosity, reasoningEffort, metadata);
+        // Make the request (pass systemPrompt and messages for potential retry)
+        yield* this.executeRequest(requestBody, model, metadata, systemPrompt, messages);
+    }
+    buildRequestBody(model, formattedInput, systemPrompt, verbosity, reasoningEffort, metadata) {
+        // Validate requested tier against model support; if not supported, omit.
+        const requestedTier = this.options.openAiNativeServiceTier || undefined;
+        const allowedTierNames = new Set(model.info.tiers?.map((t) => t.name).filter(Boolean) || []);
+        // Decide whether to enable extended prompt cache retention for this request
+        const promptCacheRetention = this.getPromptCacheRetention(model);
+        const body = {
+            model: model.id,
+            input: formattedInput,
+            stream: true,
+            // Always use stateless operation with encrypted reasoning
+            store: false,
+            // Always include instructions (system prompt) for Responses API.
+            // Unlike Chat Completions, system/developer roles in input have no special semantics here.
+            // The official way to set system behavior is the top-level `instructions` field.
+            instructions: systemPrompt,
+            // Only include encrypted reasoning content when reasoning effort is set
+            ...(reasoningEffort ? { include: ["reasoning.encrypted_content"] } : {}),
+            ...(reasoningEffort
+                ? {
+                    reasoning: {
+                        ...(reasoningEffort ? { effort: reasoningEffort } : {}),
+                        ...(this.options.enableResponsesReasoningSummary ? { summary: "auto" } : {}),
+                    },
+                }
+                : {}),
+            // Only include temperature if the model supports it
+            ...(model.info.supportsTemperature !== false && {
+                temperature: this.options.modelTemperature ?? types_1.OPENAI_NATIVE_DEFAULT_TEMPERATURE,
+            }),
+            // Explicitly include the calculated max output tokens.
+            // Use the per-request reserved output computed by Roo (params.maxTokens from getModelParams).
+            ...(model.maxTokens ? { max_output_tokens: model.maxTokens } : {}),
+            // Include tier when selected and supported by the model, or when explicitly "default"
+            ...(requestedTier &&
+                (requestedTier === "default" || allowedTierNames.has(requestedTier)) && {
+                service_tier: requestedTier,
+            }),
+            // Enable extended prompt cache retention for models that support it.
+            // This uses the OpenAI Responses API `prompt_cache_retention` parameter.
+            ...(promptCacheRetention ? { prompt_cache_retention: promptCacheRetention } : {}),
+        };
+        // Include text.verbosity only when the model explicitly supports it
+        if (model.info.supportsVerbosity === true) {
+            body.text = { verbosity: (verbosity || "medium") };
+        }
+        return body;
+    }
+    async *executeRequest(requestBody, model, metadata, systemPrompt, messages) {
+        // Create AbortController for cancellation
+        this.abortController = new AbortController();
+        try {
+            // Use the official SDK
+            const stream = (await this.client.responses.create(requestBody, {
+                signal: this.abortController.signal,
+            }));
+            if (typeof stream[Symbol.asyncIterator] !== "function") {
+                throw new Error("OpenAI SDK did not return an AsyncIterable for Responses API streaming. Falling back to SSE.");
+            }
+            for await (const event of stream) {
+                // Check if request was aborted
+                if (this.abortController.signal.aborted) {
+                    break;
+                }
+                for await (const outChunk of this.processEvent(event, model)) {
+                    yield outChunk;
+                }
+            }
+        }
+        catch (sdkErr) {
+            // For errors, fallback to manual SSE via fetch
+            yield* this.makeResponsesApiRequest(requestBody, model, metadata, systemPrompt, messages);
+        }
+        finally {
+            this.abortController = undefined;
+        }
+    }
+    formatFullConversation(systemPrompt, messages) {
+        // Format the entire conversation history for the Responses API using structured format
+        // This supports both text and images
+        // Messages already include reasoning items from API history, so we just need to format them
+        const formattedMessages = [];
+        // Do NOT embed the system prompt as a developer message in the Responses API input.
+        // The Responses API treats roles as free-form; use the top-level `instructions` field instead.
+        // Process each message
+        for (const message of messages) {
+            // Check if this is a reasoning item (already formatted in API history)
+            if (message.type === "reasoning") {
+                // Pass through reasoning items as-is
+                formattedMessages.push(message);
+                continue;
+            }
+            const role = message.role === "user" ? "user" : "assistant";
+            const content = [];
+            if (typeof message.content === "string") {
+                // For user messages, use input_text; for assistant messages, use output_text
+                if (role === "user") {
+                    content.push({ type: "input_text", text: message.content });
+                }
+                else {
+                    content.push({ type: "output_text", text: message.content });
+                }
+            }
+            else if (Array.isArray(message.content)) {
+                // For array content with potential images, format properly
+                for (const block of message.content) {
+                    if (block.type === "text") {
+                        // For user messages, use input_text; for assistant messages, use output_text
+                        if (role === "user") {
+                            content.push({ type: "input_text", text: block.text });
+                        }
+                        else {
+                            content.push({ type: "output_text", text: block.text });
+                        }
+                    }
+                    else if (block.type === "image") {
+                        const image = block;
+                        // Format image with proper data URL - images are always input_image
+                        const imageUrl = `data:${image.source.media_type};base64,${image.source.data}`;
+                        content.push({ type: "input_image", image_url: imageUrl });
+                    }
+                }
+            }
+            if (content.length > 0) {
+                formattedMessages.push({ role, content });
+            }
+        }
+        return formattedMessages;
+    }
+    async *makeResponsesApiRequest(requestBody, model, metadata, systemPrompt, messages) {
+        const apiKey = this.options.openAiNativeApiKey ?? "not-provided";
+        const baseUrl = this.options.openAiNativeBaseUrl || "https://api.openai.com";
+        const url = `${baseUrl}/v1/responses`;
+        // Create AbortController for cancellation
+        this.abortController = new AbortController();
+        try {
+            const response = await fetch(url, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${apiKey}`,
+                    Accept: "text/event-stream",
+                },
+                body: JSON.stringify(requestBody),
+                signal: this.abortController.signal,
+            });
+            if (!response.ok) {
+                const errorText = await response.text();
+                let errorMessage = `OpenAI Responses API request failed (${response.status})`;
+                let errorDetails = "";
+                // Try to parse error as JSON for better error messages
+                try {
+                    const errorJson = JSON.parse(errorText);
+                    if (errorJson.error?.message) {
+                        errorDetails = errorJson.error.message;
+                    }
+                    else if (errorJson.message) {
+                        errorDetails = errorJson.message;
+                    }
+                    else {
+                        errorDetails = errorText;
+                    }
+                }
+                catch {
+                    // If not JSON, use the raw text
+                    errorDetails = errorText;
+                }
+                // Provide user-friendly error messages based on status code
+                switch (response.status) {
+                    case 400:
+                        errorMessage = "Invalid request to Responses API. Please check your input parameters.";
+                        break;
+                    case 401:
+                        errorMessage = "Authentication failed. Please check your OpenAI API key.";
+                        break;
+                    case 403:
+                        errorMessage = "Access denied. Your API key may not have access to this endpoint.";
+                        break;
+                    case 404:
+                        errorMessage =
+                            "Responses API endpoint not found. The endpoint may not be available yet or requires a different configuration.";
+                        break;
+                    case 429:
+                        errorMessage = "Rate limit exceeded. Please try again later.";
+                        break;
+                    case 500:
+                    case 502:
+                    case 503:
+                        errorMessage = "OpenAI service error. Please try again later.";
+                        break;
+                    default:
+                        errorMessage = `Responses API error (${response.status})`;
+                }
+                // Append details if available
+                if (errorDetails) {
+                    errorMessage += ` - ${errorDetails}`;
+                }
+                throw new Error(errorMessage);
+            }
+            if (!response.body) {
+                throw new Error("Responses API error: No response body");
+            }
+            // Handle streaming response
+            yield* this.handleStreamResponse(response.body, model);
+        }
+        catch (error) {
+            if (error instanceof Error) {
+                // Re-throw with the original error message if it's already formatted
+                if (error.message.includes("Responses API")) {
+                    throw error;
+                }
+                // Otherwise, wrap it with context
+                throw new Error(`Failed to connect to Responses API: ${error.message}`);
+            }
+            // Handle non-Error objects
+            throw new Error(`Unexpected error connecting to Responses API`);
+        }
+        finally {
+            this.abortController = undefined;
+        }
+    }
+    /**
+     * Handles the streaming response from the Responses API.
+     *
+     * This function iterates through the Server-Sent Events (SSE) stream, parses each event,
+     * and yields structured data chunks (`ApiStream`). It handles a wide variety of event types,
+     * including text deltas, reasoning, usage data, and various status/tool events.
+     */
+    async *handleStreamResponse(body, model) {
+        const reader = body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let hasContent = false;
+        let totalInputTokens = 0;
+        let totalOutputTokens = 0;
+        try {
+            while (true) {
+                // Check if request was aborted
+                if (this.abortController?.signal.aborted) {
+                    break;
+                }
+                const { done, value } = await reader.read();
+                if (done)
+                    break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n");
+                buffer = lines.pop() || "";
+                for (const line of lines) {
+                    if (line.startsWith("data: ")) {
+                        const data = line.slice(6).trim();
+                        if (data === "[DONE]") {
+                            continue;
+                        }
+                        try {
+                            const parsed = JSON.parse(data);
+                            // Capture resolved service tier if present
+                            if (parsed.response?.service_tier) {
+                                this.lastServiceTier = parsed.response.service_tier;
+                            }
+                            // Capture complete output array (includes reasoning items with encrypted_content)
+                            if (parsed.response?.output && Array.isArray(parsed.response.output)) {
+                                this.lastResponseOutput = parsed.response.output;
+                            }
+                            // Capture top-level response id
+                            if (parsed.response?.id) {
+                                this.lastResponseId = parsed.response.id;
+                            }
+                            // Delegate standard event types to the shared processor to avoid duplication
+                            if (parsed?.type && this.coreHandledEventTypes.has(parsed.type)) {
+                                for await (const outChunk of this.processEvent(parsed, model)) {
+                                    // Track whether we've emitted any content so fallback handling can decide appropriately
+                                    if (outChunk.type === "text" || outChunk.type === "reasoning") {
+                                        hasContent = true;
+                                    }
+                                    yield outChunk;
+                                }
+                                continue;
+                            }
+                            // Check if this is a complete response (non-streaming format)
+                            if (parsed.response && parsed.response.output && Array.isArray(parsed.response.output)) {
+                                // Handle complete response in the initial event
+                                for (const outputItem of parsed.response.output) {
+                                    if (outputItem.type === "text" && outputItem.content) {
+                                        for (const content of outputItem.content) {
+                                            if (content.type === "text" && content.text) {
+                                                hasContent = true;
+                                                yield {
+                                                    type: "text",
+                                                    text: content.text,
+                                                };
+                                            }
+                                        }
+                                    }
+                                    // Additionally handle reasoning summaries if present (non-streaming summary output)
+                                    if (outputItem.type === "reasoning" && Array.isArray(outputItem.summary)) {
+                                        for (const summary of outputItem.summary) {
+                                            if (summary?.type === "summary_text" && typeof summary.text === "string") {
+                                                hasContent = true;
+                                                yield {
+                                                    type: "reasoning",
+                                                    text: summary.text,
+                                                };
+                                            }
+                                        }
+                                    }
+                                }
+                                // Check for usage in the complete response
+                                if (parsed.response.usage) {
+                                    const usageData = this.normalizeUsage(parsed.response.usage, model);
+                                    if (usageData) {
+                                        yield usageData;
+                                    }
+                                }
+                            }
+                            // Handle streaming delta events for text content
+                            else if (parsed.type === "response.text.delta" ||
+                                parsed.type === "response.output_text.delta") {
+                                // Primary streaming event for text deltas
+                                if (parsed.delta) {
+                                    hasContent = true;
+                                    yield {
+                                        type: "text",
+                                        text: parsed.delta,
+                                    };
+                                }
+                            }
+                            else if (parsed.type === "response.text.done" ||
+                                parsed.type === "response.output_text.done") {
+                                // Text streaming completed - final text already streamed via deltas
+                            }
+                            // Handle reasoning delta events
+                            else if (parsed.type === "response.reasoning.delta" ||
+                                parsed.type === "response.reasoning_text.delta") {
+                                // Streaming reasoning content
+                                if (parsed.delta) {
+                                    hasContent = true;
+                                    yield {
+                                        type: "reasoning",
+                                        text: parsed.delta,
+                                    };
+                                }
+                            }
+                            else if (parsed.type === "response.reasoning.done" ||
+                                parsed.type === "response.reasoning_text.done") {
+                                // Reasoning streaming completed
+                            }
+                            // Handle reasoning summary events
+                            else if (parsed.type === "response.reasoning_summary.delta" ||
+                                parsed.type === "response.reasoning_summary_text.delta") {
+                                // Streaming reasoning summary
+                                if (parsed.delta) {
+                                    hasContent = true;
+                                    yield {
+                                        type: "reasoning",
+                                        text: parsed.delta,
+                                    };
+                                }
+                            }
+                            else if (parsed.type === "response.reasoning_summary.done" ||
+                                parsed.type === "response.reasoning_summary_text.done") {
+                                // Reasoning summary completed
+                            }
+                            // Handle refusal delta events
+                            else if (parsed.type === "response.refusal.delta") {
+                                // Model is refusing to answer
+                                if (parsed.delta) {
+                                    hasContent = true;
+                                    yield {
+                                        type: "text",
+                                        text: `[Refusal] ${parsed.delta}`,
+                                    };
+                                }
+                            }
+                            else if (parsed.type === "response.refusal.done") {
+                                // Refusal completed
+                            }
+                            // Handle audio delta events (for multimodal responses)
+                            else if (parsed.type === "response.audio.delta") {
+                                // Audio streaming - we'll skip for now as we focus on text
+                                // Could be handled in future for voice responses
+                            }
+                            else if (parsed.type === "response.audio.done") {
+                                // Audio completed
+                            }
+                            // Handle audio transcript delta events
+                            else if (parsed.type === "response.audio_transcript.delta") {
+                                // Audio transcript streaming
+                                if (parsed.delta) {
+                                    hasContent = true;
+                                    yield {
+                                        type: "text",
+                                        text: parsed.delta,
+                                    };
+                                }
+                            }
+                            else if (parsed.type === "response.audio_transcript.done") {
+                                // Audio transcript completed
+                            }
+                            // Handle content part events (for structured content)
+                            else if (parsed.type === "response.content_part.added") {
+                                // New content part added - could be text, image, etc.
+                                if (parsed.part?.type === "text" && parsed.part.text) {
+                                    hasContent = true;
+                                    yield {
+                                        type: "text",
+                                        text: parsed.part.text,
+                                    };
+                                }
+                            }
+                            else if (parsed.type === "response.content_part.done") {
+                                // Content part completed
+                            }
+                            // Handle output item events (alternative format)
+                            else if (parsed.type === "response.output_item.added") {
+                                // This is where the actual content comes through in some test cases
+                                if (parsed.item) {
+                                    if (parsed.item.type === "text" && parsed.item.text) {
+                                        hasContent = true;
+                                        yield { type: "text", text: parsed.item.text };
+                                    }
+                                    else if (parsed.item.type === "reasoning" && parsed.item.text) {
+                                        hasContent = true;
+                                        yield { type: "reasoning", text: parsed.item.text };
+                                    }
+                                    else if (parsed.item.type === "message" && parsed.item.content) {
+                                        // Handle message type items
+                                        for (const content of parsed.item.content) {
+                                            if (content.type === "text" && content.text) {
+                                                hasContent = true;
+                                                yield { type: "text", text: content.text };
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            else if (parsed.type === "response.output_item.done") {
+                                // Output item completed
+                            }
+                            // Handle function/tool call events
+                            else if (parsed.type === "response.function_call_arguments.delta") {
+                                // Function call arguments streaming
+                                // We could yield this as a special type if needed for tool usage
+                            }
+                            else if (parsed.type === "response.function_call_arguments.done") {
+                                // Function call completed
+                            }
+                            // Handle MCP (Model Context Protocol) tool events
+                            else if (parsed.type === "response.mcp_call_arguments.delta") {
+                                // MCP tool call arguments streaming
+                            }
+                            else if (parsed.type === "response.mcp_call_arguments.done") {
+                                // MCP tool call completed
+                            }
+                            else if (parsed.type === "response.mcp_call.in_progress") {
+                                // MCP tool call in progress
+                            }
+                            else if (parsed.type === "response.mcp_call.completed" ||
+                                parsed.type === "response.mcp_call.failed") {
+                                // MCP tool call status events
+                            }
+                            else if (parsed.type === "response.mcp_list_tools.in_progress") {
+                                // MCP list tools in progress
+                            }
+                            else if (parsed.type === "response.mcp_list_tools.completed" ||
+                                parsed.type === "response.mcp_list_tools.failed") {
+                                // MCP list tools status events
+                            }
+                            // Handle web search events
+                            else if (parsed.type === "response.web_search_call.searching") {
+                                // Web search in progress
+                            }
+                            else if (parsed.type === "response.web_search_call.in_progress") {
+                                // Processing web search results
+                            }
+                            else if (parsed.type === "response.web_search_call.completed") {
+                                // Web search completed
+                            }
+                            // Handle code interpreter events
+                            else if (parsed.type === "response.code_interpreter_call_code.delta") {
+                                // Code interpreter code streaming
+                                if (parsed.delta) {
+                                    // Could yield as a special code type if needed
+                                }
+                            }
+                            else if (parsed.type === "response.code_interpreter_call_code.done") {
+                                // Code interpreter code completed
+                            }
+                            else if (parsed.type === "response.code_interpreter_call.interpreting") {
+                                // Code interpreter running
+                            }
+                            else if (parsed.type === "response.code_interpreter_call.in_progress") {
+                                // Code execution in progress
+                            }
+                            else if (parsed.type === "response.code_interpreter_call.completed") {
+                                // Code interpreter completed
+                            }
+                            // Handle file search events
+                            else if (parsed.type === "response.file_search_call.searching") {
+                                // File search in progress
+                            }
+                            else if (parsed.type === "response.file_search_call.in_progress") {
+                                // Processing file search results
+                            }
+                            else if (parsed.type === "response.file_search_call.completed") {
+                                // File search completed
+                            }
+                            // Handle image generation events
+                            else if (parsed.type === "response.image_gen_call.generating") {
+                                // Image generation in progress
+                            }
+                            else if (parsed.type === "response.image_gen_call.in_progress") {
+                                // Processing image generation
+                            }
+                            else if (parsed.type === "response.image_gen_call.partial_image") {
+                                // Image partially generated
+                            }
+                            else if (parsed.type === "response.image_gen_call.completed") {
+                                // Image generation completed
+                            }
+                            // Handle computer use events
+                            else if (parsed.type === "response.computer_tool_call.output_item" ||
+                                parsed.type === "response.computer_tool_call.output_screenshot") {
+                                // Computer use tool events
+                            }
+                            // Handle annotation events
+                            else if (parsed.type === "response.output_text_annotation.added" ||
+                                parsed.type === "response.text_annotation.added") {
+                                // Text annotation events - could be citations, references, etc.
+                            }
+                            // Handle error events
+                            else if (parsed.type === "response.error" || parsed.type === "error") {
+                                // Error event from the API
+                                if (parsed.error || parsed.message) {
+                                    throw new Error(`Responses API error: ${parsed.error?.message || parsed.message || "Unknown error"}`);
+                                }
+                            }
+                            // Handle incomplete event
+                            else if (parsed.type === "response.incomplete") {
+                                // Response was incomplete - might need to handle specially
+                            }
+                            // Handle queued event
+                            else if (parsed.type === "response.queued") {
+                                // Response is queued
+                            }
+                            // Handle in_progress event
+                            else if (parsed.type === "response.in_progress") {
+                                // Response is being processed
+                            }
+                            // Handle failed event
+                            else if (parsed.type === "response.failed") {
+                                // Response failed
+                                if (parsed.error || parsed.message) {
+                                    throw new Error(`Response failed: ${parsed.error?.message || parsed.message || "Unknown failure"}`);
+                                }
+                            }
+                            else if (parsed.type === "response.completed" || parsed.type === "response.done") {
+                                // Capture resolved service tier if present
+                                if (parsed.response?.service_tier) {
+                                    this.lastServiceTier = parsed.response.service_tier;
+                                }
+                                // Capture top-level response id
+                                if (parsed.response?.id) {
+                                    this.lastResponseId = parsed.response.id;
+                                }
+                                // Capture complete output array (includes reasoning items with encrypted_content)
+                                if (parsed.response?.output && Array.isArray(parsed.response.output)) {
+                                    this.lastResponseOutput = parsed.response.output;
+                                }
+                                // Check if the done event contains the complete output (as a fallback)
+                                if (!hasContent &&
+                                    parsed.response &&
+                                    parsed.response.output &&
+                                    Array.isArray(parsed.response.output)) {
+                                    for (const outputItem of parsed.response.output) {
+                                        if (outputItem.type === "message" && outputItem.content) {
+                                            for (const content of outputItem.content) {
+                                                if (content.type === "output_text" && content.text) {
+                                                    hasContent = true;
+                                                    yield {
+                                                        type: "text",
+                                                        text: content.text,
+                                                    };
+                                                }
+                                            }
+                                        }
+                                        // Also surface reasoning summaries if present in the final output
+                                        if (outputItem.type === "reasoning" && Array.isArray(outputItem.summary)) {
+                                            for (const summary of outputItem.summary) {
+                                                if (summary?.type === "summary_text" &&
+                                                    typeof summary.text === "string") {
+                                                    hasContent = true;
+                                                    yield {
+                                                        type: "reasoning",
+                                                        text: summary.text,
+                                                    };
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // Usage for done/completed is already handled by processEvent in the SDK path.
+                                // For SSE path, usage often arrives separately; avoid double-emitting here.
+                            }
+                            // These are structural or status events, we can just log them at a lower level or ignore.
+                            else if (parsed.type === "response.created" ||
+                                parsed.type === "response.in_progress" ||
+                                parsed.type === "response.output_item.done" ||
+                                parsed.type === "response.content_part.added" ||
+                                parsed.type === "response.content_part.done") {
+                                // Status events - no action needed
+                            }
+                            // Fallback for older formats or unexpected responses
+                            else if (parsed.choices?.[0]?.delta?.content) {
+                                hasContent = true;
+                                yield {
+                                    type: "text",
+                                    text: parsed.choices[0].delta.content,
+                                };
+                            }
+                            // Additional fallback: some events place text under 'item.text' even if type isn't matched above
+                            else if (parsed.item &&
+                                typeof parsed.item.text === "string" &&
+                                parsed.item.text.length > 0) {
+                                hasContent = true;
+                                yield {
+                                    type: "text",
+                                    text: parsed.item.text,
+                                };
+                            }
+                            else if (parsed.usage) {
+                                // Handle usage if it arrives in a separate, non-completed event
+                                const usageData = this.normalizeUsage(parsed.usage, model);
+                                if (usageData) {
+                                    yield usageData;
+                                }
+                            }
+                        }
+                        catch (e) {
+                            // Only ignore JSON parsing errors, re-throw actual API errors
+                            if (!(e instanceof SyntaxError)) {
+                                throw e;
+                            }
+                        }
+                    }
+                    // Also try to parse non-SSE formatted lines
+                    else if (line.trim() && !line.startsWith(":")) {
+                        try {
+                            const parsed = JSON.parse(line);
+                            // Try to extract content from various possible locations
+                            if (parsed.content || parsed.text || parsed.message) {
+                                hasContent = true;
+                                yield {
+                                    type: "text",
+                                    text: parsed.content || parsed.text || parsed.message,
+                                };
+                            }
+                        }
+                        catch {
+                            // Not JSON, might be plain text - ignore
+                        }
+                    }
+                }
+            }
+            // If we didn't get any content, don't throw - the API might have returned an empty response
+            // This can happen in certain edge cases and shouldn't break the flow
+        }
+        catch (error) {
+            if (error instanceof Error) {
+                throw new Error(`Error processing response stream: ${error.message}`);
+            }
+            throw new Error("Unexpected error processing response stream");
+        }
+        finally {
+            reader.releaseLock();
+        }
+    }
+    /**
+     * Shared processor for Responses API events.
+     */
+    async *processEvent(event, model) {
+        // Capture resolved service tier when available
+        if (event?.response?.service_tier) {
+            this.lastServiceTier = event.response.service_tier;
+        }
+        // Capture complete output array (includes reasoning items with encrypted_content)
+        if (event?.response?.output && Array.isArray(event.response.output)) {
+            this.lastResponseOutput = event.response.output;
+        }
+        // Capture top-level response id
+        if (event?.response?.id) {
+            this.lastResponseId = event.response.id;
+        }
+        // Handle known streaming text deltas
+        if (event?.type === "response.text.delta" || event?.type === "response.output_text.delta") {
+            if (event?.delta) {
+                yield { type: "text", text: event.delta };
+            }
+            return;
+        }
+        // Handle reasoning deltas (including summary variants)
+        if (event?.type === "response.reasoning.delta" ||
+            event?.type === "response.reasoning_text.delta" ||
+            event?.type === "response.reasoning_summary.delta" ||
+            event?.type === "response.reasoning_summary_text.delta") {
+            if (event?.delta) {
+                yield { type: "reasoning", text: event.delta };
+            }
+            return;
+        }
+        // Handle refusal deltas
+        if (event?.type === "response.refusal.delta") {
+            if (event?.delta) {
+                yield { type: "text", text: `[Refusal] ${event.delta}` };
+            }
+            return;
+        }
+        // Handle output item additions (SDK or Responses API alternative format)
+        if (event?.type === "response.output_item.added") {
+            const item = event?.item;
+            if (item) {
+                if (item.type === "text" && item.text) {
+                    yield { type: "text", text: item.text };
+                }
+                else if (item.type === "reasoning" && item.text) {
+                    yield { type: "reasoning", text: item.text };
+                }
+                else if (item.type === "message" && Array.isArray(item.content)) {
+                    for (const content of item.content) {
+                        // Some implementations send 'text'; others send 'output_text'
+                        if ((content?.type === "text" || content?.type === "output_text") && content?.text) {
+                            yield { type: "text", text: content.text };
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        // Completion events that may carry usage
+        if (event?.type === "response.done" || event?.type === "response.completed") {
+            const usage = event?.response?.usage || event?.usage || undefined;
+            const usageData = this.normalizeUsage(usage, model);
+            if (usageData) {
+                yield usageData;
+            }
+            return;
+        }
+        // Fallbacks for older formats or unexpected objects
+        if (event?.choices?.[0]?.delta?.content) {
+            yield { type: "text", text: event.choices[0].delta.content };
+            return;
+        }
+        if (event?.usage) {
+            const usageData = this.normalizeUsage(event.usage, model);
+            if (usageData) {
+                yield usageData;
+            }
+        }
+    }
+    getReasoningEffort(model) {
+        // Single source of truth: user setting overrides, else model default (from types).
+        const selected = this.options.reasoningEffort ?? model.info.reasoningEffort;
+        return selected && selected !== "disable" ? selected : undefined;
+    }
+    /**
+     * Returns the appropriate prompt cache retention policy for the given model, if any.
+     *
+     * The policy is driven by ModelInfo.promptCacheRetention so that model-specific details
+     * live in the shared types layer rather than this provider. When set to "24h" and the
+     * model supports prompt caching, extended prompt cache retention is requested.
+     */
+    getPromptCacheRetention(model) {
+        if (!model.info.supportsPromptCache)
+            return undefined;
+        if (model.info.promptCacheRetention === "24h") {
+            return "24h";
+        }
+        return undefined;
+    }
+    /**
+     * Returns a shallow-cloned ModelInfo with pricing overridden for the given tier, if available.
+     * If no tier or no overrides exist, the original ModelInfo is returned.
+     */
+    applyServiceTierPricing(info, tier) {
+        if (!tier || tier === "default")
+            return info;
+        // Find the tier with matching name in the tiers array
+        const tierInfo = info.tiers?.find((t) => t.name === tier);
+        if (!tierInfo)
+            return info;
+        return {
+            ...info,
+            inputPrice: tierInfo.inputPrice ?? info.inputPrice,
+            outputPrice: tierInfo.outputPrice ?? info.outputPrice,
+            cacheReadsPrice: tierInfo.cacheReadsPrice ?? info.cacheReadsPrice,
+            cacheWritesPrice: tierInfo.cacheWritesPrice ?? info.cacheWritesPrice,
+        };
+    }
+    // Removed isResponsesApiModel method as ALL models now use the Responses API
+    getModel() {
+        const modelId = this.options.apiModelId;
+        let id = modelId && modelId in types_1.openAiNativeModels ? modelId : types_1.openAiNativeDefaultModelId;
+        const info = types_1.openAiNativeModels[id];
+        const params = (0, model_params_1.getModelParams)({
+            format: "openai",
+            modelId: id,
+            model: info,
+            settings: this.options,
+            defaultTemperature: types_1.OPENAI_NATIVE_DEFAULT_TEMPERATURE,
+        });
+        // Reasoning effort inclusion is handled by getModelParams/getOpenAiReasoning.
+        // Do not re-compute or filter efforts here.
+        // The o3 models are named like "o3-mini-[reasoning-effort]", which are
+        // not valid model ids, so we need to strip the suffix.
+        return { id: id.startsWith("o3-mini") ? "o3-mini" : id, info, ...params, verbosity: params.verbosity };
+    }
+    /**
+     * Extracts encrypted_content and id from the first reasoning item in the output array.
+     * This is the minimal data needed for stateless API continuity.
+     *
+     * @returns Object with encrypted_content and id, or undefined if not available
+     */
+    getEncryptedContent() {
+        if (!this.lastResponseOutput)
+            return undefined;
+        // Find the first reasoning item with encrypted_content
+        const reasoningItem = this.lastResponseOutput.find((item) => item.type === "reasoning" && item.encrypted_content);
+        if (!reasoningItem?.encrypted_content)
+            return undefined;
+        return {
+            encrypted_content: reasoningItem.encrypted_content,
+            ...(reasoningItem.id ? { id: reasoningItem.id } : {}),
+        };
+    }
+    getResponseId() {
+        return this.lastResponseId;
+    }
+    async completePrompt(prompt) {
+        // Create AbortController for cancellation
+        this.abortController = new AbortController();
+        try {
+            const model = this.getModel();
+            const { verbosity, reasoning } = model;
+            // Resolve reasoning effort for models that support it
+            const reasoningEffort = this.getReasoningEffort(model);
+            // Build request body for Responses API
+            const requestBody = {
+                model: model.id,
+                input: [
+                    {
+                        role: "user",
+                        content: [{ type: "input_text", text: prompt }],
+                    },
+                ],
+                stream: false, // Non-streaming for completePrompt
+                store: false, // Don't store prompt completions
+                // Only include encrypted reasoning content when reasoning effort is set
+                ...(reasoningEffort ? { include: ["reasoning.encrypted_content"] } : {}),
+            };
+            // Include service tier if selected and supported
+            const requestedTier = this.options.openAiNativeServiceTier || undefined;
+            const allowedTierNames = new Set(model.info.tiers?.map((t) => t.name).filter(Boolean) || []);
+            if (requestedTier && (requestedTier === "default" || allowedTierNames.has(requestedTier))) {
+                requestBody.service_tier = requestedTier;
+            }
+            // Add reasoning if supported
+            if (reasoningEffort) {
+                requestBody.reasoning = {
+                    effort: reasoningEffort,
+                    ...(this.options.enableResponsesReasoningSummary ? { summary: "auto" } : {}),
+                };
+            }
+            // Only include temperature if the model supports it
+            if (model.info.supportsTemperature !== false) {
+                requestBody.temperature = this.options.modelTemperature ?? types_1.OPENAI_NATIVE_DEFAULT_TEMPERATURE;
+            }
+            // Include max_output_tokens if available
+            if (model.maxTokens) {
+                requestBody.max_output_tokens = model.maxTokens;
+            }
+            // Include text.verbosity only when the model explicitly supports it
+            if (model.info.supportsVerbosity === true) {
+                requestBody.text = { verbosity: (verbosity || "medium") };
+            }
+            // Enable extended prompt cache retention for eligible models
+            const promptCacheRetention = this.getPromptCacheRetention(model);
+            if (promptCacheRetention) {
+                requestBody.prompt_cache_retention = promptCacheRetention;
+            }
+            // Make the non-streaming request
+            const response = await this.client.responses.create(requestBody, {
+                signal: this.abortController.signal,
+            });
+            // Extract text from the response
+            if (response?.output && Array.isArray(response.output)) {
+                for (const outputItem of response.output) {
+                    if (outputItem.type === "message" && outputItem.content) {
+                        for (const content of outputItem.content) {
+                            if (content.type === "output_text" && content.text) {
+                                return content.text;
+                            }
+                        }
+                    }
+                }
+            }
+            // Fallback: check for direct text in response
+            if (response?.text) {
+                return response.text;
+            }
+            return "";
+        }
+        catch (error) {
+            if (error instanceof Error) {
+                throw new Error(`OpenAI Native completion error: ${error.message}`);
+            }
+            throw error;
+        }
+        finally {
+            this.abortController = undefined;
+        }
+    }
+}
+exports.OpenAiNativeHandler = OpenAiNativeHandler;
+//# sourceMappingURL=openai-native.js.map

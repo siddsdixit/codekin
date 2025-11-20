@@ -1,0 +1,23 @@
+{
+	"name": "@codekin/orchestrator",
+	"version": "0.1.0",
+	"description": "Smart task orchestration with parallel execution for Codekin",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"scripts": {
+		"build": "tsc",
+		"dev": "tsc --watch",
+		"clean": "rimraf dist"
+	},
+	"dependencies": {
+		"@codekin/db": "workspace:^",
+		"@codekin/agents": "workspace:^",
+		"events": "^3.3.0"
+	},
+	"devDependencies": {
+		"@roo-code/config-typescript": "workspace:^",
+		"@types/node": "^24.1.0",
+		"typescript": "^5.4.5",
+		"rimraf": "^6.0.1"
+	}
+}

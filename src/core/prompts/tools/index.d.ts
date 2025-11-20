@@ -1,0 +1,27 @@
+import type { ModeConfig } from "@roo-code/types";
+import { DiffStrategy } from "../../../shared/tools";
+import { McpHub } from "../../../services/mcp/McpHub";
+import { Mode } from "../../../shared/modes";
+import { getExecuteCommandDescription } from "./execute-command";
+import { getReadFileDescription } from "./read-file";
+import { getSimpleReadFileDescription } from "./simple-read-file";
+import { getFetchInstructionsDescription } from "./fetch-instructions";
+import { getWriteToFileDescription } from "./write-to-file";
+import { getSearchFilesDescription } from "./search-files";
+import { getListFilesDescription } from "./list-files";
+import { getInsertContentDescription } from "./insert-content";
+import { getListCodeDefinitionNamesDescription } from "./list-code-definition-names";
+import { getBrowserActionDescription } from "./browser-action";
+import { getAskFollowupQuestionDescription } from "./ask-followup-question";
+import { getAttemptCompletionDescription } from "./attempt-completion";
+import { getUseMcpToolDescription } from "./use-mcp-tool";
+import { getAccessMcpResourceDescription } from "./access-mcp-resource";
+import { getSwitchModeDescription } from "./switch-mode";
+import { getCodebaseSearchDescription } from "./codebase-search";
+import { getRunSlashCommandDescription } from "./run-slash-command";
+import { getGenerateImageDescription } from "./generate-image";
+import { CodeIndexManager } from "../../../services/code-index/manager";
+export declare function getToolDescriptionsForMode(mode: Mode, cwd: string, supportsComputerUse: boolean, codeIndexManager?: CodeIndexManager, diffStrategy?: DiffStrategy, browserViewportSize?: string, mcpHub?: McpHub, customModes?: ModeConfig[], experiments?: Record<string, boolean>, partialReadsEnabled?: boolean, settings?: Record<string, any>, enableMcpServerCreation?: boolean, modelId?: string): string;
+export { getExecuteCommandDescription, getReadFileDescription, getSimpleReadFileDescription, getFetchInstructionsDescription, getWriteToFileDescription, getSearchFilesDescription, getListFilesDescription, getListCodeDefinitionNamesDescription, getBrowserActionDescription, getAskFollowupQuestionDescription, getAttemptCompletionDescription, getUseMcpToolDescription, getAccessMcpResourceDescription, getSwitchModeDescription, getInsertContentDescription, getCodebaseSearchDescription, getRunSlashCommandDescription, getGenerateImageDescription, };
+export { nativeTools } from "./native-tools";
+//# sourceMappingURL=index.d.ts.map
