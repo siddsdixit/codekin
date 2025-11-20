@@ -54,3 +54,4 @@ Thumbs.db
 *.pem
 .cache/
 
+node_modules
