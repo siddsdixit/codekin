@@ -11,7 +11,7 @@ import { BaseTelemetryClient } from "./BaseTelemetryClient"
  * Respects user privacy settings and VSCode's global telemetry configuration.
  */
 export class PostHogTelemetryClient extends BaseTelemetryClient {
-	private client: PostHog
+	private client: PostHog | null = null
 	private distinctId: string = vscode.env.machineId
 	// Git repository properties that should be filtered out
 	private readonly gitPropertyNames = ["repositoryUrl", "repositoryName", "defaultBranch"]
@@ -25,7 +25,13 @@ export class PostHogTelemetryClient extends BaseTelemetryClient {
 			debug,
 		)
 
-		this.client = new PostHog(process.env.POSTHOG_API_KEY || "", { host: "https://us.i.posthog.com" })
+		// Only initialize PostHog if API key is available
+		const apiKey = process.env.POSTHOG_API_KEY
+		if (apiKey) {
+			this.client = new PostHog(apiKey, { host: "https://us.i.posthog.com" })
+		} else if (debug) {
+			console.warn("[PostHogTelemetryClient] PostHog API key not found, telemetry will be disabled")
+		}
 	}
 
 	/**

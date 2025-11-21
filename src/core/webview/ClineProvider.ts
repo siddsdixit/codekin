@@ -959,6 +959,10 @@ export class ClineProvider
 			}
 
 			this.outputChannel.appendLine("[Codekin] ✓ Webview resolved successfully!")
+
+			// Post initial state to webview
+			this.outputChannel.appendLine("[Codekin] Posting initial state to webview...")
+			await this.postStateToWebview()
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error)
 			const errorStack = error instanceof Error ? error.stack : undefined
