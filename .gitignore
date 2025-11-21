@@ -54,4 +54,8 @@ Thumbs.db
 *.pem
 .cache/
 
+# Turbo
+.turbo/
+.vite-port
+
 node_modules
