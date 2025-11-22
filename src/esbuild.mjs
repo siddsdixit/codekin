@@ -60,8 +60,8 @@ async function main() {
 					)
 					copyPaths(
 						[
-							["../webview-ui/build", "webview/build"],
-							["../webview-ui/audio", "webview/audio"],
+							["../webview-ui/build", "webview/build", { optional: true }],
+							["../webview-ui/audio", "webview/audio", { optional: true }],
 						],
 						srcDir,
 						distDir,

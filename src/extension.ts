@@ -326,7 +326,7 @@ export async function activate(context: vscode.ExtensionContext) {
 				
 				// Wait a bit and check if resolveWebviewView was called
 				setTimeout(() => {
-					if (provider.view) {
+					if (provider.getView()) {
 						outputChannel.appendLine("[Codekin] ✓ Webview view is available after refresh")
 					} else {
 						outputChannel.appendLine("[Codekin] ⚠️ Webview view still not available - VS Code cache issue")

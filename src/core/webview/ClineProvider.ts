@@ -648,6 +648,14 @@ export class ClineProvider
 		return visibleProvider
 	}
 
+	/**
+	 * Get the webview view or panel instance.
+	 * @returns The view if it exists, undefined otherwise.
+	 */
+	public getView(): vscode.WebviewView | vscode.WebviewPanel | undefined {
+		return this.view
+	}
+
 	public static async isActiveTask(): Promise<boolean> {
 		const visibleProvider = await ClineProvider.getInstance()
 

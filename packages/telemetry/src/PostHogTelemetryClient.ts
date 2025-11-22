@@ -60,6 +60,10 @@ export class PostHogTelemetryClient extends BaseTelemetryClient {
 			console.info(`[PostHogTelemetryClient#capture] ${event.event}`)
 		}
 
+		if (!this.client) {
+			return
+		}
+
 		this.client.capture({
 			distinctId: this.distinctId,
 			event: event.event,
@@ -86,14 +90,18 @@ export class PostHogTelemetryClient extends BaseTelemetryClient {
 		}
 
 		// Update PostHog client state based on telemetry preference.
-		if (this.telemetryEnabled) {
-			this.client.optIn()
-		} else {
-			this.client.optOut()
+		if (this.client) {
+			if (this.telemetryEnabled) {
+				this.client.optIn()
+			} else {
+				this.client.optOut()
+			}
 		}
 	}
 
 	public override async shutdown(): Promise<void> {
-		await this.client.shutdown()
+		if (this.client) {
+			await this.client.shutdown()
+		}
 	}
 }
